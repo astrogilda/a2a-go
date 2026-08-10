@@ -17,6 +17,7 @@ package eventqueue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -24,6 +25,10 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 )
+
+// assertionTimeout is how long a test waits for an operation that must not be held up by a
+// subscriber that stopped reading, before declaring the broker wedged.
+const assertionTimeout = 3 * time.Second
 
 type eventVersionPair struct {
 	event   a2a.Event
@@ -278,4 +283,175 @@ func TestInMemoryQueue_BlockedWriteOnFullQueueThenDestroy(t *testing.T) {
 		}
 	}
 	<-completed
+}
+
+// stallBroker registers a subscriber that is never drained and never closed, and starts a
+// writer that fills its buffer. That is what a streaming client which stopped reading
+// without disconnecting looks like to the broker. It returns the abandoned subscriber.
+func stallBroker(t *testing.T, qm Manager, tid a2a.TaskID, bufferSize int) Reader {
+	t.Helper()
+	ctx := t.Context()
+
+	writer, err := qm.CreateWriter(ctx, tid)
+	if err != nil {
+		t.Fatalf("qm.CreateWriter() error = %v", err)
+	}
+	stalled, err := qm.CreateReader(ctx, tid)
+	if err != nil {
+		t.Fatalf("qm.CreateReader() error = %v", err)
+	}
+
+	go func() {
+		for i := range bufferSize + 8 {
+			event := &a2a.Message{ID: fmt.Sprintf("stall-%d", i)}
+			if err := writer.Write(ctx, &Message{Event: event}); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Let the writer fill the abandoned subscriber's buffer, so that the broker is already
+	// parked on the send to it by the time the assertions run.
+	time.Sleep(100 * time.Millisecond)
+	return stalled
+}
+
+// drainReader keeps reading a subscriber into a channel, so that the subscriber under
+// assertion is never itself the one holding up the broker. The channel is closed once the
+// subscriber stops delivering.
+func drainReader(t *testing.T, reader Reader) <-chan *Message {
+	t.Helper()
+	ctx := t.Context()
+	delivered := make(chan *Message, 64)
+	go func() {
+		defer close(delivered)
+		for {
+			msg, err := reader.Read(ctx)
+			if err != nil {
+				return
+			}
+			select {
+			case delivered <- msg:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return delivered
+}
+
+func TestInMemoryQueue_StalledSubscriberDoesNotBlockClose(t *testing.T) {
+	t.Parallel()
+	qm := newTestManager(t, WithQueueBufferSize(1))
+	tid := a2a.NewTaskID()
+
+	peer, err := qm.CreateReader(t.Context(), tid)
+	if err != nil {
+		t.Fatalf("qm.CreateReader() error = %v", err)
+	}
+	stallBroker(t, qm, tid, 1)
+
+	closed := make(chan error, 1)
+	go func() { closed <- peer.Close() }()
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("peer.Close() error = %v, want nil", err)
+		}
+	case <-time.After(assertionTimeout):
+		t.Fatalf("peer.Close() did not return within %v, want nil", assertionTimeout)
+	}
+}
+
+func TestInMemoryQueue_StalledSubscriberDoesNotBlockNewSubscriber(t *testing.T) {
+	t.Parallel()
+	qm := newTestManager(t, WithQueueBufferSize(1))
+	tid := a2a.NewTaskID()
+
+	stallBroker(t, qm, tid, 1)
+
+	created := make(chan error, 1)
+	go func() {
+		_, err := qm.CreateReader(t.Context(), tid)
+		created <- err
+	}()
+
+	select {
+	case err := <-created:
+		if err != nil {
+			t.Fatalf("qm.CreateReader() error = %v, want nil", err)
+		}
+	case <-time.After(assertionTimeout):
+		t.Fatalf("qm.CreateReader() did not return within %v, want a reader", assertionTimeout)
+	}
+}
+
+func TestInMemoryQueue_StalledSubscriberIsDroppedAndOthersResume(t *testing.T) {
+	t.Parallel()
+	qm := newTestManager(t, WithQueueBufferSize(1), WithSlowSubscriberTimeout(100*time.Millisecond))
+	tid := a2a.NewTaskID()
+
+	peer, err := qm.CreateReader(t.Context(), tid)
+	if err != nil {
+		t.Fatalf("qm.CreateReader() error = %v", err)
+	}
+	delivered := drainReader(t, peer)
+
+	stalled := stallBroker(t, qm, tid, 1)
+
+	const wantEvents = 5
+	for i := range wantEvents {
+		select {
+		case _, ok := <-delivered:
+			if !ok {
+				t.Fatalf("peer.Read() delivered %d events, want %d", i, wantEvents)
+			}
+		case <-time.After(assertionTimeout):
+			t.Fatalf("peer.Read() delivered %d events within %v, want %d", i, assertionTimeout, wantEvents)
+		}
+	}
+
+	// The dropped subscriber may still drain what it buffered, then reports the drop.
+	readCtx, cancel := context.WithTimeout(t.Context(), assertionTimeout)
+	defer cancel()
+	for {
+		_, err := stalled.Read(readCtx)
+		if errors.Is(err, ErrQueueClosed) {
+			return
+		}
+		if err != nil {
+			t.Fatalf("stalled.Read() error = %v, want %v", err, ErrQueueClosed)
+		}
+	}
+}
+
+func TestInMemoryQueue_StalledSubscriberBlocksWhenDroppingDisabled(t *testing.T) {
+	t.Parallel()
+	qm := newTestManager(t, WithQueueBufferSize(1), WithSlowSubscriberTimeout(0))
+	tid := a2a.NewTaskID()
+
+	peer, err := qm.CreateReader(t.Context(), tid)
+	if err != nil {
+		t.Fatalf("qm.CreateReader() error = %v", err)
+	}
+	delivered := drainReader(t, peer)
+
+	stallBroker(t, qm, tid, 1)
+
+	// With dropping disabled the queue keeps its unbounded blocking backpressure, so the
+	// stalled subscriber does hold up dispatch. This is what makes the test above an
+	// assertion about dropping rather than about the buffer being large enough.
+	const wantEvents = 5
+	deadline := time.After(500 * time.Millisecond)
+	for i := range wantEvents {
+		select {
+		case <-delivered:
+		case <-deadline:
+			return
+		}
+		if i == wantEvents-1 {
+			t.Fatalf("peer.Read() delivered %d events, want the stalled subscriber to hold up dispatch", wantEvents)
+		}
+	}
 }

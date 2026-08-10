@@ -17,11 +17,18 @@ package eventqueue
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 )
 
-const defaultQueueBufferSize = 32
+const (
+	defaultQueueBufferSize = 32
+
+	// defaultSlowSubscriberTimeout bounds how long one subscriber that is not reading
+	// may hold up a task's event dispatch before it is dropped.
+	defaultSlowSubscriberTimeout = 30 * time.Second
+)
 
 // MemManagerOption is a functional option for configuring an in-memory event manager.
 type MemManagerOption func(*inMemoryManager)
@@ -33,12 +40,27 @@ func WithQueueBufferSize(size int) MemManagerOption {
 	}
 }
 
+// WithSlowSubscriberTimeout configures how long the broker waits for a subscriber whose
+// buffer is full to make room before dropping it. A dropped subscriber's [Reader] returns
+// [ErrQueueClosed] and the client can recover by resubscribing; every other subscriber of
+// the task, and the writer, are released at that point.
+//
+// A zero or negative duration disables dropping and restores unbounded blocking
+// backpressure, in which case a subscriber that never reads blocks the task's dispatch
+// for as long as it stays registered.
+func WithSlowSubscriberTimeout(timeout time.Duration) MemManagerOption {
+	return func(manager *inMemoryManager) {
+		manager.slowSubscriberTimeout = timeout
+	}
+}
+
 // inMemoryManager implements Manager interface.
 type inMemoryManager struct {
 	mu      sync.Mutex
 	brokers map[a2a.TaskID]*inMemoryEventBroker
 
-	bufferSize int
+	bufferSize            int
+	slowSubscriberTimeout time.Duration
 }
 
 var _ Manager = (*inMemoryManager)(nil)
@@ -53,10 +75,15 @@ var _ Manager = (*inMemoryManager)(nil)
 // Queue.Read() will not receive a message sent using Write() call on the same queue.
 // Queue.Close() unregisters a queue from further broadcasts.
 // Queue.Close() may partially drain the queue, so Read() behavior after is Close() is undefined.
+//
+// A subscriber that stops draining its buffer holds up Write() and delivery to the task's
+// other subscribers, so one that stays full for the duration configured by
+// [WithSlowSubscriberTimeout] is dropped and its Read() returns [ErrQueueClosed].
 func NewInMemoryManager(options ...MemManagerOption) Manager {
 	manager := &inMemoryManager{
-		brokers:    make(map[a2a.TaskID]*inMemoryEventBroker),
-		bufferSize: defaultQueueBufferSize,
+		brokers:               make(map[a2a.TaskID]*inMemoryEventBroker),
+		bufferSize:            defaultQueueBufferSize,
+		slowSubscriberTimeout: defaultSlowSubscriberTimeout,
 	}
 	for _, opt := range options {
 		opt(manager)
@@ -77,7 +104,7 @@ func (m *inMemoryManager) createReadWriter(ctx context.Context, taskID a2a.TaskI
 	defer m.mu.Unlock()
 	broker, ok := m.brokers[taskID]
 	if !ok {
-		broker = newInMemoryEventBroker(m.bufferSize)
+		broker = newInMemoryEventBroker(m.bufferSize, m.slowSubscriberTimeout)
 		m.brokers[taskID] = broker
 	}
 	return broker.connect()

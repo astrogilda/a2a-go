@@ -17,6 +17,7 @@ package eventqueue
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 type broadcast struct {
@@ -34,18 +35,20 @@ type inMemoryEventBroker struct {
 	unregisterChan chan *inMemoryQueue
 	broadcastChan  chan *broadcast
 
-	queueBufferSize int
+	queueBufferSize       int
+	slowSubscriberTimeout time.Duration
 }
 
-func newInMemoryEventBroker(queueBufferSize int) *inMemoryEventBroker {
+func newInMemoryEventBroker(queueBufferSize int, slowSubscriberTimeout time.Duration) *inMemoryEventBroker {
 	broker := &inMemoryEventBroker{
-		registered:      make(map[*inMemoryQueue]any),
-		registerChan:    make(chan *inMemoryQueue),
-		unregisterChan:  make(chan *inMemoryQueue),
-		broadcastChan:   make(chan *broadcast),
-		destroySignal:   make(chan struct{}),
-		destroyed:       make(chan struct{}),
-		queueBufferSize: queueBufferSize,
+		registered:            make(map[*inMemoryQueue]any),
+		registerChan:          make(chan *inMemoryQueue),
+		unregisterChan:        make(chan *inMemoryQueue),
+		broadcastChan:         make(chan *broadcast),
+		destroySignal:         make(chan struct{}),
+		destroyed:             make(chan struct{}),
+		queueBufferSize:       queueBufferSize,
+		slowSubscriberTimeout: slowSubscriberTimeout,
 	}
 	go func() {
 		defer func() {
@@ -58,27 +61,15 @@ func newInMemoryEventBroker(queueBufferSize int) *inMemoryEventBroker {
 		for {
 			select {
 			case b := <-broker.broadcastChan:
-				for queue := range broker.registered {
-					if queue == b.sender {
-						continue
-					}
-
-					select {
-					case queue.eventsChan <- b.payload:
-					case <-broker.destroySignal:
-						return
-					}
+				if !broker.dispatch(b) {
+					return
 				}
-				close(b.dispatched)
 
 			case sub := <-broker.registerChan:
 				broker.registered[sub] = struct{}{}
 
 			case sub := <-broker.unregisterChan:
-				if _, ok := broker.registered[sub]; ok {
-					delete(broker.registered, sub)
-					sub.destroy()
-				}
+				broker.unregister(sub)
 
 			case <-broker.destroySignal:
 				return
@@ -86,6 +77,77 @@ func newInMemoryEventBroker(queueBufferSize int) *inMemoryEventBroker {
 		}
 	}()
 	return broker
+}
+
+// dispatch fans a broadcast out to every registered queue except the sender and reports
+// whether the broker should keep running. The recipients are snapshotted first because
+// deliver serves registrations while a send is pending: a queue that registers during a
+// broadcast does not receive that broadcast, it starts from the next one.
+func (b *inMemoryEventBroker) dispatch(bc *broadcast) bool {
+	recipients := make([]*inMemoryQueue, 0, len(b.registered))
+	for queue := range b.registered {
+		if queue == bc.sender {
+			continue
+		}
+		recipients = append(recipients, queue)
+	}
+	for _, queue := range recipients {
+		if !b.deliver(queue, bc.payload) {
+			return false
+		}
+	}
+	close(bc.dispatched)
+	return true
+}
+
+// deliver hands one payload to one queue and reports whether the broker should keep running.
+//
+// A send to a full queue is the point where a subscriber that stopped reading used to take
+// the whole broker down with it: the broker goroutine parked on the send, so it served no
+// registration, no unregistration and no further broadcast, and nothing ever recovered. Two
+// things prevent that here. The broker keeps serving registration and unregistration while
+// the send is pending, so peers can always connect and disconnect. And a subscriber that
+// stays full for slowSubscriberTimeout is dropped, so an abandoned stream degrades only
+// itself: its Reader starts returning [ErrQueueClosed] and the client recovers by
+// resubscribing, which is cheaper than a gap the client cannot detect.
+func (b *inMemoryEventBroker) deliver(queue *inMemoryQueue, payload *Message) bool {
+	var slow <-chan time.Time
+	if b.slowSubscriberTimeout > 0 {
+		timer := time.NewTimer(b.slowSubscriberTimeout)
+		defer timer.Stop()
+		slow = timer.C
+	}
+	for {
+		if _, registered := b.registered[queue]; !registered {
+			// Unregistered while we waited, by its own Close or by the timeout below.
+			return true
+		}
+		select {
+		case queue.eventsChan <- payload:
+			return true
+
+		case sub := <-b.registerChan:
+			b.registered[sub] = struct{}{}
+
+		case sub := <-b.unregisterChan:
+			b.unregister(sub)
+
+		case <-slow:
+			b.unregister(queue)
+			return true
+
+		case <-b.destroySignal:
+			return false
+		}
+	}
+}
+
+func (b *inMemoryEventBroker) unregister(queue *inMemoryQueue) {
+	if _, ok := b.registered[queue]; !ok {
+		return
+	}
+	delete(b.registered, queue)
+	queue.destroy()
 }
 
 func (b *inMemoryEventBroker) connect() (*inMemoryQueue, error) {
