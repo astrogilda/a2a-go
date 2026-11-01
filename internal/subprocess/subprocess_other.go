@@ -1,4 +1,4 @@
-// Copyright 2025 The A2A Authors
+// Copyright 2026 The A2A Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,27 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package taskupdate
+//go:build !unix
+
+package subprocess
 
 import (
-	"github.com/a2aproject/a2a-go/v2/a2a"
+	"errors"
+	"os"
+	"os/exec"
 )
 
-// IsFinal returns true if event must terminate a valid execution event sequence.
-func IsFinal(event a2a.Event) bool {
-	if _, ok := event.(*a2a.Message); ok {
-		return true
-	}
+func configureProcessGroup(*exec.Cmd) {}
 
-	var state a2a.TaskState
-	switch v := event.(type) {
-	case *a2a.TaskStatusUpdateEvent:
-		state = v.Status.State
-	case *a2a.Task:
-		state = v.Status.State
-	default:
-		return false
-	}
+func terminateProcessGroup(c *exec.Cmd) error { return killProcessGroup(c) }
 
-	return state.Terminal() || state == a2a.TaskStateInputRequired
+func killProcessGroup(c *exec.Cmd) error {
+	err := c.Process.Kill()
+	if errors.Is(err, os.ErrProcessDone) {
+		return nil
+	}
+	return err
 }
